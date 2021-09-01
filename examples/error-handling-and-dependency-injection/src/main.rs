@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, sync::Mutex};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
 #[tokio::main]
@@ -34,7 +34,7 @@ async fn main() {
 
     // Inject a `UserRepo` into our handlers via a trait object. This could be
     // the live implementation or just a mock for testing.
-    let user_repo = Arc::new(Mutex::new(ExampleUserRepo));
+    let user_repo = Arc::new(tokio::sync::Mutex::new(ExampleUserRepo));
 
     // Build our application with some routes
     let app = Router::new()
@@ -62,14 +62,29 @@ async fn users_show(
     Path(user_id): Path<Uuid>,
     Extension(user_repo): Extension<DynUserRepo>,
 ) -> Result<Json<User>, AppError> {
-    let user_repo = user_repo.lock().unwrap();
+    let user_repo = user_repo.lock().await;
     let user = user_repo.find(user_id).await?;
 
     Ok(user.into())
 }
 
-async fn test() -> Result<(), AppError> {
-    Ok(())
+struct DbTest {
+    conn: redis::aio::Connection,
+}
+
+impl DbTest {
+    pub async fn connect(address: &str) -> Self {
+        Self {
+            conn: redis::Client::open(address)
+                .unwrap()
+                .get_async_connection()
+                .await
+                .unwrap(),
+        }
+    }
+    pub async fn test(&self) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 /// Handler for `POST /users`.
@@ -77,12 +92,10 @@ async fn users_create(
     Json(params): Json<CreateUser>,
     Extension(user_repo): Extension<DynUserRepo>,
 ) -> Result<Json<User>, AppError> {
-    let r = test().await?;
-    let user_repo = user_repo.lock().unwrap();
+    let user_repo = user_repo.lock().await;
     let user = user_repo.create(params).await?;
-    let c = redis::Client::open("127.0.0.1:6601")?.get_async_connection().await?;
-    // let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    // let mut con = client.get_async_connection().await?;
+    let db = DbTest::connect("127.0.0.1:6601").await;
+    db.test().await?; // will cause compile error
     Ok(user.into())
 }
 
@@ -90,7 +103,7 @@ async fn users_create(
 enum AppError {
     /// Something went wrong when calling the user repo.
     UserRepo(UserRepoError),
-    RedisError(redis::RedisError)
+    RedisError(redis::RedisError),
 }
 
 /// This makes it possible to use `?` to automatically convert a `UserRepoError`
@@ -119,9 +132,7 @@ impl IntoResponse for AppError {
             AppError::UserRepo(UserRepoError::InvalidUsername) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "Invalid username")
             }
-            AppError::RedisError(_) => {
-                (StatusCode::NOT_ACCEPTABLE, "redis error") 
-            }
+            AppError::RedisError(_) => (StatusCode::NOT_ACCEPTABLE, "redis error"),
         };
 
         let body = Json(json!({
@@ -147,7 +158,7 @@ impl UserRepo for ExampleUserRepo {
 }
 
 /// Type alias that makes it easier to extract `UserRepo` trait objects.
-type DynUserRepo = Arc<Mutex<ExampleUserRepo>>;
+type DynUserRepo = Arc<tokio::sync::Mutex<ExampleUserRepo>>;
 
 /// A trait that defines things a user repo might support.
 #[async_trait]
