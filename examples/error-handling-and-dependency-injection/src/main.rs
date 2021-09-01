@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, sync::Mutex};
 use uuid::Uuid;
 
 #[tokio::main]
@@ -34,7 +34,7 @@ async fn main() {
 
     // Inject a `UserRepo` into our handlers via a trait object. This could be
     // the live implementation or just a mock for testing.
-    let user_repo = Arc::new(ExampleUserRepo) as DynUserRepo;
+    let user_repo = Arc::new(Mutex::new(ExampleUserRepo));
 
     // Build our application with some routes
     let app = Router::new()
@@ -62,9 +62,14 @@ async fn users_show(
     Path(user_id): Path<Uuid>,
     Extension(user_repo): Extension<DynUserRepo>,
 ) -> Result<Json<User>, AppError> {
+    let user_repo = user_repo.lock().unwrap();
     let user = user_repo.find(user_id).await?;
 
     Ok(user.into())
+}
+
+async fn test() -> Result<(), AppError> {
+    Ok(())
 }
 
 /// Handler for `POST /users`.
@@ -72,8 +77,12 @@ async fn users_create(
     Json(params): Json<CreateUser>,
     Extension(user_repo): Extension<DynUserRepo>,
 ) -> Result<Json<User>, AppError> {
+    let r = test().await?;
+    let user_repo = user_repo.lock().unwrap();
     let user = user_repo.create(params).await?;
-
+    let c = redis::Client::open("127.0.0.1:6601")?.get_async_connection().await?;
+    // let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    // let mut con = client.get_async_connection().await?;
     Ok(user.into())
 }
 
@@ -81,6 +90,7 @@ async fn users_create(
 enum AppError {
     /// Something went wrong when calling the user repo.
     UserRepo(UserRepoError),
+    RedisError(redis::RedisError)
 }
 
 /// This makes it possible to use `?` to automatically convert a `UserRepoError`
@@ -88,6 +98,12 @@ enum AppError {
 impl From<UserRepoError> for AppError {
     fn from(inner: UserRepoError) -> Self {
         AppError::UserRepo(inner)
+    }
+}
+
+impl From<redis::RedisError> for AppError {
+    fn from(inner: redis::RedisError) -> Self {
+        AppError::RedisError(inner)
     }
 }
 
@@ -102,6 +118,9 @@ impl IntoResponse for AppError {
             }
             AppError::UserRepo(UserRepoError::InvalidUsername) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "Invalid username")
+            }
+            AppError::RedisError(_) => {
+                (StatusCode::NOT_ACCEPTABLE, "redis error") 
             }
         };
 
@@ -128,7 +147,7 @@ impl UserRepo for ExampleUserRepo {
 }
 
 /// Type alias that makes it easier to extract `UserRepo` trait objects.
-type DynUserRepo = Arc<dyn UserRepo + Send + Sync>;
+type DynUserRepo = Arc<Mutex<ExampleUserRepo>>;
 
 /// A trait that defines things a user repo might support.
 #[async_trait]
